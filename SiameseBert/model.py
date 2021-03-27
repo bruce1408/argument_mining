@@ -1,118 +1,75 @@
-"""BERT and RNN model for sentence pair classification.
 
-Author: Yixu GAO (yxgao19@fudan.edu.cn)
+import logging
+import math
+import os
 
-Used for SMP-CAIL2020-Argmine.
-"""
 import torch
-
 from torch import nn
-from torch.nn.utils.rnn import pack_padded_sequence, PackedSequence
-from transformers.models.bert.modeling_bert import BertModel
-# from transformers.modeling_bert import BertModel
+from torch.nn import CrossEntropyLoss, MSELoss
+from transformers import BertPreTrainedModel, BertModel, BertConfig
 
-
-class BertForClassification(nn.Module):
-    """BERT with simple linear model."""
+class CusBertForNextSentencePrediction(BertPreTrainedModel):
     def __init__(self, config):
-        """Initialize the model with config dict.
+        super().__init__(config)
 
-        Args:
-            config: python dict must contains the attributes below:
-                config.bert_model_path: pretrained model path or model type
-                    e.g. 'bert-base-chinese'
-                config.hidden_size: The same as BERT model, usually 768
-                config.num_classes: int, e.g. 2
-                config.dropout: float between 0 and 1
-        """
-        super().__init__()
-        self.bert = BertModel.from_pretrained(config.bert_model_path)
-        for param in self.bert.parameters():
-            param.requires_grad = True
+        self.bert = BertModel(config)
+        # self.cls = BertOnlyNSPHead(config)
 
-        # 全连接层，把768变成2
-        self.linear = nn.Linear(config.hidden_size, config.num_classes) 
-        # dropout层
-        self.dropout = nn.Dropout(config.dropout)
-        self.num_classes = config.num_classes
+        self.init_weights()
 
-    def forward(self, input_ids, attention_mask, token_type_ids):
-        """Forward inputs and get logits.
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        next_sentence_label=None,
+    ):
 
-        Args:
-            input_ids: (batch_size, max_seq_len)
-            attention_mask: (batch_size, max_seq_len)
-            token_type_ids: (batch_size, max_seq_len)
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+        )
 
-        Returns:
-            logits: (batch_size, num_classes)
-        """
-        batch_size = input_ids.shape[0]
-        bert_output = self.bert(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, encoder_hidden_states=False)
-        # bert_output[0]: (batch_size, sequence_length, hidden_size)
-        # bert_output[1]: (batch_size, hidden_size)
-        pooled_output = bert_output[1]
-        pooled_output = self.dropout(pooled_output)
-        logits = self.linear(pooled_output).view(batch_size, self.num_classes)
-        logits = nn.functional.softmax(logits, dim=-1)
-        # logits: (batch_size, num_classes)
-        return logits
+        pooled_output = outputs[1]
+        return pooled_output
 
 
-class RnnForSentencePairClassification(nn.Module):
-    """Unidirectional GRU model for sentences pair classification.
-    2 sentences use the same encoder and concat to a linear model.
-    """
-    def __init__(self, config):
-        """Initialize the model with config dict.
+class CusArgModel(nn.Module):
+    def __init__(self, pre_train_path):
+        super(CusArgModel, self).__init__()
+        config = BertConfig.from_pretrained(pre_train_path)
+        self.bert_model1 = CusBertForNextSentencePrediction.from_pretrained(pre_train_path,
+                                                                           config=config)
+        self.bert_model2 = CusBertForNextSentencePrediction.from_pretrained(pre_train_path,
+                                                                           config=config)
+        self.dropout = nn.Dropout(0.1)
+        self.relu = nn.Tanh()
+        self.cls = nn.Linear(768*2, 2)
 
-        Args:
-            config: python dict must contains the attributes below:
-                config.vocab_size: vocab size
-                config.hidden_size: RNN hidden size and embedding dim
-                config.num_classes: int, e.g. 2
-                config.dropout: float between 0 and 1
-        """
-        super().__init__()
-        self.embedding = nn.Embedding(
-            config.vocab_size, config.hidden_size, padding_idx=0)
-        self.rnn = nn.GRU(
-            config.hidden_size, hidden_size=config.hidden_size,
-            bidirectional=False, batch_first=True)
-        self.linear = nn.Linear(config.hidden_size * 2, config.num_classes)
-        self.dropout = nn.Dropout(config.dropout)
-        self.num_classes = config.num_classes
+    def forward(self, inp, attention_mask, input_type_mask, r_inp, r_attention_mask,
+                r_input_type_mask, next_sentence_label=None):
+        pooled_output = self.bert_model1(inp, attention_mask, input_type_mask)
+        r_pooled_output = self.bert_model2(r_inp, r_attention_mask, r_input_type_mask)
 
-    def forward(self, s1_ids, s2_ids, s1_lengths, s2_lengths):
-        """Forward inputs and get logits.
+        cat_pooled_output = torch.cat((pooled_output, r_pooled_output), dim=-1)
+        cat_pooled_output = self.dropout(cat_pooled_output)
+        cat_pooled_output = self.relu(cat_pooled_output)
 
-        Args:
-            s1_ids: (batch_size, max_seq_len)
-            s2_ids: (batch_size, max_seq_len)
-            s1_lengths: (batch_size)
-            s2_lengths: (batch_size)
+        # out = self.cls(cat_pooled_output)
+        seq_relationship_score = self.cls(cat_pooled_output)
 
-        Returns:
-            logits: (batch_size, num_classes)
-        """
-        batch_size = s1_ids.shape[0]
-        # ids: (batch_size, max_seq_len)
-        s1_embed = self.embedding(s1_ids)
-        s2_embed = self.embedding(s2_ids)
-        # embed: (batch_size, max_seq_len, hidden_size)
-        s1_packed: PackedSequence = pack_padded_sequence(
-            s1_embed, s1_lengths, batch_first=True, enforce_sorted=False)
-        s2_packed: PackedSequence = pack_padded_sequence(
-            s2_embed, s2_lengths, batch_first=True, enforce_sorted=False)
-        # packed: (sum(lengths), hidden_size)
-        self.rnn.flatten_parameters()
-        _, s1_hidden = self.rnn(s1_packed)
-        _, s2_hidden = self.rnn(s2_packed)
-        s1_hidden = s1_hidden.view(batch_size, -1)
-        s2_hidden = s2_hidden.view(batch_size, -1)
-        hidden = torch.cat([s1_hidden, s2_hidden], dim=-1)
-        hidden = self.linear(hidden).view(-1, self.num_classes)
-        hidden = self.dropout(hidden)
-        logits = nn.functional.softmax(hidden, dim=-1)
-        # logits: (batch_size, num_classes)
-        return logits
+        outputs = (seq_relationship_score,)
+        if next_sentence_label is not None:
+            loss_fct = CrossEntropyLoss()
+            next_sentence_loss = loss_fct(seq_relationship_score.view(-1, 2), next_sentence_label.view(-1))
+            outputs = (next_sentence_loss,) + outputs
+
+        return outputs  # (next_sentence_loss)
+

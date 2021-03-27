@@ -1,75 +1,83 @@
-"""Test model for SMP-CAIL2020-Argmine.
-
-Author: Yixu GAO yxgao19@fudan.edu.cn
-
-Usage:
-    python main.py --model_config 'config/bert_config.json' \
-                   --in_file 'data/SMP-CAIL2020-test1.csv' \
-                   --out_file 'bert-submission-test-1.csv'
-    python main.py --model_config 'config/rnn_config.json' \
-                   --in_file 'data/SMP-CAIL2020-test1.csv' \
-                   --out_file 'rnn-submission-test-1.csv'
-"""
-import json
-import os
-from types import SimpleNamespace
-
-import fire
 import pandas as pd
+import numpy as np
 import torch
+from transformers import BertTokenizer, BertConfig
+import tqdm
 from torch.utils.data import DataLoader
 
-from data import Data
-from evaluate import evaluate
-from model import BertForClassification, RnnForSentencePairClassification
-from utils import load_torch_model
+from utils import MyDataSet
+from model2 import CusBertForNextSentencePrediction
+from model3 import CusArgModel
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-LABELS = ['1', '2', '3', '4', '5']
-MODEL_MAP = {
-    'bert': BertForClassification,
-    'rnn': RnnForSentencePairClassification
-}
+def prediction(model, valid_iter, device="cuda"):
+    model.eval()
+    with torch.no_grad():
+        # log = Logger('valid.log', level='info')
+        preds = []
+        for data in tqdm.tqdm(valid_iter):
+            bc_input_ids, sc_input_ids, inp, attention_mask, input_type_mask, r_inp, r_attention_mask, r_input_type_mask = data
+            bc_input_ids = torch.stack(bc_input_ids).permute(1, 0).to(device)
+            sc_input_ids = torch.stack(sc_input_ids).permute(1, 0).to(device)
+            inp = torch.stack(inp).permute(1, 0).to(device)
+            attention_mask = torch.stack(attention_mask).permute(1, 0).to(device)
+            input_type_mask = torch.stack(input_type_mask).permute(1, 0).to(device)
+            r_inp = torch.stack(r_inp).permute(1, 0).to(device)
+            r_attention_mask = torch.stack(r_attention_mask).permute(1, 0).to(device)
+            r_input_type_mask = torch.stack(r_input_type_mask).permute(1, 0).to(device)
 
+            outputs = model(inp, attention_mask, input_type_mask,
+                                  r_inp, r_attention_mask, r_input_type_mask, bc_input_ids, sc_input_ids)
 
-def main(in_file='data/SMP-CAIL2020-test1.csv',
-         out_file='submission.csv',
-         model_config='config/rnn_config.json'):
-    """Test model for given test set on 1 GPU or CPU.
+            # print("outputs: ", outputs)
 
-    Args:
-        in_file: file to be tested
-        out_file: output file
-        model_config: config file
-    """
-    # 0. Load config
-    with open(model_config) as fin:
-        config = json.load(fin, object_hook=lambda d: SimpleNamespace(**d))
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-    else:
-        device = torch.device('cpu')
-    # 1. Load data
-    data = Data(vocab_file=os.path.join(config.model_path, 'vocab.txt'),
-                max_seq_len=config.max_seq_len,
-                model_type=config.model_type)
-    test_set = data.load_file(in_file, train=False)
-    data_loader_test = DataLoader(
-        test_set, batch_size=config.batch_size, shuffle=False)
-    # 2. Load model
-    model = MODEL_MAP[config.model_type](config)
-    model = load_torch_model(
-        model, model_path=os.path.join(config.model_path, 'model.bin'))
-    model.to(device)
-    # 3. Evaluate
-    answer_list = evaluate(model, data_loader_test, device)
-    # 4. Write answers to file
-    id_list = pd.read_csv(in_file)['id'].tolist()
-    with open(out_file, 'w') as fout:
-        fout.write('id,answer\n')
-        for i, j in zip(id_list, answer_list):
-            fout.write(str(i) + ',' + str(j) + '\n')
+            preds.append(outputs[0][0][1].item())
+
+        answer_list = []
+        for i in range(0, len(preds), 5):
+            logits = preds[i:i + 5]
+            answer1 = int(torch.argmax(torch.tensor(logits)))
+            answer_list.append(answer1 + 1)
+        print(answer_list)
+        answer_list = np.array(answer_list)
+
+    return answer_list
 
 
 if __name__ == '__main__':
-    fire.Fire(main)
+    pretrain_path = "pretrain_model/ERNIE_1.0_max-len-512-pytorch"
+    best_model_path = 'models/best.pt'
+
+    model = CusArgModel(pretrain_path)
+    model.load_state_dict(torch.load(best_model_path))
+    model.to(device)
+
+    # text_path = "/home/wl/Desktop/lbwj_train/SMP-CAIL2020-Argmine-train/SMP-CAIL2020-text-train.csv"
+    # arg_path = "data/valid.csv"
+    # output_file = "res.csv"
+
+    text_path = "/input/SMP-CAIL2020-text-test1.csv"
+    arg_path = "/input/SMP-CAIL2020-test1.csv"
+    output_file = "/output/result1.csv"
+
+
+    valid_dataset = MyDataSet(vocab_file=pretrain_path, file_path=arg_path, text_path=text_path, train_type="test")
+    valid_iter = DataLoader(valid_dataset, batch_size=1, shuffle=False)
+
+    result = prediction(model, valid_iter, device)
+    data = pd.read_csv(arg_path)
+    all_idxs = data["id"]
+
+    ans = pd.DataFrame(columns=['id', 'answer'])
+    for i,res in enumerate(result):
+        idx = int(all_idxs[i])
+        print(idx)
+        ans.loc[idx, 'id'] = idx
+        ans.loc[idx, 'answer'] = res
+
+    ans['id'] = ans['id'].astype('int')
+    ans['answer'] = ans['answer'].astype('int')
+    ans.to_csv(output_file, encoding='utf-8', index=False)
+

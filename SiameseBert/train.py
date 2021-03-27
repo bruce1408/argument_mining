@@ -1,275 +1,192 @@
-"""Training file for SMP-CAIL2020-Argmine.
-
-Author: Yixu GAO yxgao19@fudan.edu.cn
-
-Usage:
-    python -m torch.distributed.launch train.py \
-        --config_file 'config/bert_config.json'
-    CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch train.py \
-        --config_file 'config/rnn_config.json'
-"""
-from typing import Dict
-import argparse
-import json
-import os
-from copy import deepcopy
-from types import SimpleNamespace
-import os
-
 import torch
-from torch import nn
-from torch.optim import Adam
-from torch.utils.data import DataLoader, RandomSampler
-from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm, trange
-from transformers.optimization import (AdamW, get_linear_schedule_with_warmup, get_constant_schedule)
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from transformers import AdamW, BertTokenizer
+import os
+from costumLog import Logger
+from logging import log
+import tqdm
+import random
+import numpy as np
 
-from data import Data
-from evaluate import evaluate, calculate_accuracy_f1, get_labels_from_file
-from model import BertForClassification, RnnForSentencePairClassification
-from utils import get_csv_logger, get_path
-from vocab import build_vocab
+from model2 import CusBertForNextSentencePrediction
+from model3 import CusArgModel
+from utils import MyDataSet, get_acc, FGM
 
-
-MODEL_MAP = {
-    'bert': BertForClassification,
-    'rnn': RnnForSentencePairClassification
-}
-
-
-class Trainer:
-    """Trainer for SMP-CAIL2020-Argmine.
-
-
-    """
-    def __init__(self,
-                 model, data_loader: Dict[str, DataLoader], device, config):
-        """Initialize trainer with model, data, device, and config.
-        Initialize optimizer, scheduler, criterion.
-
-        Args:
-            model: model to be evaluated
-            data_loader: dict of torch.utils.data.DataLoader
-            device: torch.device('cuda') or torch.device('cpu')
-            config:
-                config.experiment_name: experiment name
-                config.model_type: 'bert' or 'rnn'
-                config.lr: learning rate for optimizer
-                config.num_epoch: epoch number
-                config.num_warmup_steps: warm-up steps number
-                config.gradient_accumulation_steps: gradient accumulation steps
-                config.max_grad_norm: max gradient norm
-
-        """
-        self.model = model
-        self.device = device
-        self.config = config
-        self.data_loader = data_loader
-        self.config.num_training_steps = config.num_epoch * (
-            len(data_loader['train']) // config.batch_size)
-        self.optimizer = self._get_optimizer()
-        self.scheduler = self._get_scheduler()
-        self.criterion = nn.CrossEntropyLoss()
-
-    def _get_optimizer(self):
-        """Get optimizer for different models.
-
-        Returns:
-            optimizer
-        """
-        if self.config.model_type == 'bert':
-            no_decay = ['bias', 'gamma', 'beta']
-            optimizer_parameters = [
-                {'params': [p for n, p in self.model.named_parameters()
-                            if not any(nd in n for nd in no_decay)],
-                 'weight_decay_rate': 0.01},
-                {'params': [p for n, p in self.model.named_parameters()
-                            if any(nd in n for nd in no_decay)],
-                 'weight_decay_rate': 0.0}]
-            optimizer = AdamW(
-                optimizer_parameters,
-                lr=self.config.lr,
-                betas=(0.9, 0.999),
-                weight_decay=1e-8,
-                correct_bias=False)
-        else:  # rnn
-            optimizer = Adam(self.model.parameters(), lr=self.config.lr)
-        return optimizer
-
-    def _get_scheduler(self):
-        """Get scheduler for different models.
-
-        Returns:
-            scheduler
-        """
-        if self.config.model_type == 'bert':
-            scheduler = get_linear_schedule_with_warmup(
-                self.optimizer,
-                num_warmup_steps=self.config.num_warmup_steps,
-                num_training_steps=self.config.num_training_steps)
-        else:  # rnn
-            scheduler = get_constant_schedule(self.optimizer)
-        return scheduler
-
-    def _evaluate_for_train_valid(self):
-        """Evaluate model on train and valid set and get acc and f1 score.
-
-        Returns:
-            train_acc, train_f1, valid_acc, valid_f1
-        """
-        train_predictions = evaluate(
-            model=self.model, data_loader=self.data_loader['valid_train'],
-            device=self.device)
-        valid_predictions = evaluate(
-            model=self.model, data_loader=self.data_loader['valid_valid'],
-            device=self.device)
-        train_answers = get_labels_from_file(self.config.train_file_path)
-        valid_answers = get_labels_from_file(self.config.valid_file_path)
-        train_acc, train_f1 = calculate_accuracy_f1(
-            train_answers, train_predictions)
-        valid_acc, valid_f1 = calculate_accuracy_f1(
-            valid_answers, valid_predictions)
-        return train_acc, train_f1, valid_acc, valid_f1
-
-    def _epoch_evaluate_update_description_log(
-            self, tqdm_obj, logger, epoch):
-        """Evaluate model and update logs for epoch.
-
-        Args:
-            tqdm_obj: tqdm/trange object with description to be updated
-            logger: logging.logger
-            epoch: int
-
-        Return:
-            train_acc, train_f1, valid_acc, valid_f1
-        """
-        # Evaluate model for train and valid set
-        results = self._evaluate_for_train_valid()
-        train_acc, train_f1, valid_acc, valid_f1 = results
-        # Update tqdm description for command line
-        tqdm_obj.set_description(
-            'Epoch: {:d}, train_acc: {:.6f}, train_f1: {:.6f}, '
-            'valid_acc: {:.6f}, valid_f1: {:.6f}, '.format(
-                epoch, train_acc, train_f1, valid_acc, valid_f1))
-        # Logging
-        logger.info(','.join([str(epoch)] + [str(s) for s in results]))
-        return train_acc, train_f1, valid_acc, valid_f1
-
-    def save_model(self, filename):
-        """Save model to file.
-
-        Args:
-            filename: file name
-        """
-        torch.save(self.model.state_dict(), filename)
-
-    def train(self):
-        """Train model on train set and evaluate on train and valid set.
-
-        Returns:
-            state dict of the best model with highest valid f1 score
-        """
-        epoch_logger = get_csv_logger(
-            os.path.join(self.config.log_path,
-                         self.config.experiment_name + '-epoch.csv'),
-            title='epoch,train_acc,train_f1,valid_acc,valid_f1')
-        step_logger = get_csv_logger(
-            os.path.join(self.config.log_path,
-                         self.config.experiment_name + '-step.csv'),
-            title='step,loss')
-        trange_obj = trange(self.config.num_epoch, desc='Epoch', ncols=120)
-        self._epoch_evaluate_update_description_log(
-            tqdm_obj=trange_obj, logger=epoch_logger, epoch=0)
-        best_model_state_dict, best_valid_f1, global_step = None, 0, 0
-        for epoch, _ in enumerate(trange_obj):
-            self.model.train()
-            tqdm_obj = tqdm(self.data_loader['train'], ncols=80)
-            for step, batch in enumerate(tqdm_obj):
-                batch = tuple(t.to(self.device) for t in batch)
-                logits = self.model(*batch[:-1])  # the last one is label
-                loss = self.criterion(logits, batch[-1])
-                if self.config.gradient_accumulation_steps > 1:
-                    loss = loss / self.config.gradient_accumulation_steps
-                self.optimizer.zero_grad()
-                loss.backward()
-                if (step + 1) % self.config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.max_grad_norm)
-                    self.optimizer.step()
-                    self.scheduler.step()
-                    global_step += 1
-                    tqdm_obj.set_description('loss: {:.6f}'.format(loss.item()))
-                    step_logger.info(str(global_step) + ',' + str(loss.item()))
-            results = self._epoch_evaluate_update_description_log(
-                tqdm_obj=trange_obj, logger=epoch_logger, epoch=epoch + 1)
-            self.save_model(os.path.join(
-                self.config.model_path, self.config.experiment_name,
-                self.config.model_type + '-' + str(epoch + 1) + '.bin'))
-            if results[-1] > best_valid_f1:
-                best_model_state_dict = deepcopy(self.model.state_dict())
-                best_valid_f1 = results[-1]
-        return best_model_state_dict
+os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
+seed = 43
+np.random.seed(seed)
+random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = True
 
 
-def main(config_file='config/bert_config.json'):
-    """Main method for training.
+def train(model, train_iter, optimizer, criterion, device="cuda"):
+    model.train()
+    total_loss = 0.0
+    total_acc = 0.0
+    steps = 0
+    log = Logger('training_random_seed.log', level='info')
+    fgm = FGM(model)
+    for data in tqdm.tqdm(train_iter):
+        # convert data to gpu
+        bc_input_ids, sc_input_ids, inp, attention_mask, input_type_mask, r_inp, r_attention_mask, r_input_type_mask, label = data
+        bc_input_ids = torch.stack(bc_input_ids).permute(1, 0).to(device)
+        sc_input_ids = torch.stack(sc_input_ids).permute(1, 0).to(device)
+        inp = torch.stack(inp).permute(1, 0).to(device)
+        attention_mask = torch.stack(attention_mask).permute(1, 0).to(device)
+        input_type_mask = torch.stack(input_type_mask).permute(1, 0).to(device)
+        r_inp = torch.stack(r_inp).permute(1, 0).to(device)
+        r_attention_mask = torch.stack(r_attention_mask).permute(1, 0).to(device)
+        r_input_type_mask = torch.stack(r_input_type_mask).permute(1, 0).to(device)
+        label = torch.tensor(label).to(device)
 
-    Args:
-        config_file: in config dir
-    """
-    # 0. Load config and mkdir
-    with open(config_file) as fin:
-        config = json.load(fin, object_hook=lambda d: SimpleNamespace(**d))
-    get_path(os.path.join(config.model_path, config.experiment_name))
-    get_path(config.log_path)
-    if config.model_type == 'rnn':  # build vocab for rnn
-        build_vocab(file_in=config.all_train_file_path,
-                    file_out=os.path.join(config.model_path, 'vocab.txt'))
-    # 1. Load data
-    data = Data(vocab_file=os.path.join(config.model_path, 'vocab.txt'),
-                max_seq_len=config.max_seq_len,
-                model_type=config.model_type)
-    datasets = data.load_train_and_valid_files(
-        train_file=config.train_file_path,
-        valid_file=config.valid_file_path)
+        # begin to model to train
+        loss, outputs = model(inp, attention_mask, input_type_mask,
+                              r_inp, r_attention_mask, r_input_type_mask, bc_input_ids, sc_input_ids, next_sentence_label=label)
+        
+        # loss = criterion(outputs, label)
+        total_loss += loss.item()
+        acc = get_acc(outputs, label)
+        total_acc += acc
+        log.logger.info("the train acc is: %f" % acc)
 
-    train_set, valid_set_train, valid_set_valid = datasets
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-        torch.distributed.init_process_group(backend="nccl")
-        sampler_train = DistributedSampler(train_set)
-    else:
-        device = torch.device('cpu')
-        sampler_train = RandomSampler(train_set)
-    data_loader = {
-        'train': DataLoader(
-            train_set, sampler=sampler_train, batch_size=config.batch_size),
-        'valid_train': DataLoader(
-            valid_set_train, batch_size=config.batch_size, shuffle=False),
-        'valid_valid': DataLoader(
-            valid_set_valid, batch_size=config.batch_size, shuffle=False)}
-    # 2. Build model
-    model = MODEL_MAP[config.model_type](config)
-    model.to(device)
-    if torch.cuda.is_available():
-        model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
+        loss.backward()  # 反向传播，得到正常的grad
+        # 对抗训练, 在embedding上添加对抗扰动
+        fgm.attack()  
+        loss_adv, outputs = model(inp, attention_mask, input_type_mask, 
+            r_inp, r_attention_mask, r_input_type_mask, bc_input_ids, sc_input_ids, next_sentence_label=label)
+        
+        # 反向传播，并在正常的grad基础上，累加对抗训练的梯度
+        loss_adv.backward()
 
-    # 3. Train
-    trainer = Trainer(model=model, data_loader=data_loader, device=device, config=config)
-    best_model_state_dict = trainer.train()
-    
-    # 4. Save model
-    torch.save(best_model_state_dict, os.path.join(config.model_path, 'model.bin'))
+        # 恢复embedding参数  
+        fgm.restore()  
+
+        # 梯度下降，更新参数
+        optimizer.step()
+        model.zero_grad()
+        steps += 1
+    return total_loss / steps, total_acc / steps
+
+
+def valid(model, valid_iter, criterion, device="cuda"):
+    model.eval()
+    with torch.no_grad():
+        total_loss = 0.0
+        total_acc = 0.0
+        steps = 0
+        log = Logger('valid_random_seed.log', level='info')
+        labels = []
+        preds = []
+        for data in tqdm.tqdm(valid_iter):
+            bc_input_ids, sc_input_ids, inp, attention_mask, input_type_mask, r_inp, r_attention_mask, r_input_type_mask, label = data
+            bc_input_ids = torch.stack(bc_input_ids).permute(1, 0).to(device)
+            sc_input_ids = torch.stack(sc_input_ids).permute(1, 0).to(device)
+            inp = torch.stack(inp).permute(1, 0).to(device)
+            attention_mask = torch.stack(attention_mask).permute(1, 0).to(device)
+            input_type_mask = torch.stack(input_type_mask).permute(1, 0).to(device)
+            r_inp = torch.stack(r_inp).permute(1, 0).to(device)
+            r_attention_mask = torch.stack(r_attention_mask).permute(1, 0).to(device)
+            r_input_type_mask = torch.stack(r_input_type_mask).permute(1, 0).to(device)
+            label = torch.tensor(label).to(device)
+
+            loss, outputs = model(inp, attention_mask, input_type_mask,
+                                  r_inp, r_attention_mask, r_input_type_mask, bc_input_ids, sc_input_ids, next_sentence_label=label)
+
+            labels.append(label.item())
+            preds.append(outputs[0][1].item())
+
+            total_loss += loss.item()
+            acc = get_acc(outputs, label)
+            total_acc += acc
+            log.logger.info("the valid acc is: %f" % acc)
+
+            steps += 1
+        answer_list = []
+        label_answer_list = []
+        for i in range(0, len(preds), 5):
+            logits = preds[i:i + 5]
+            answer = int(torch.argmax(torch.tensor(logits)))
+            answer_list.append(answer + 1)
+
+            logits = labels[i:i + 5]
+            answer = int(torch.argmax(torch.tensor(logits)))
+            label_answer_list.append(answer + 1)
+
+        answer_list = np.array(answer_list)
+        label_answer_list = np.array(label_answer_list)
+        res = answer_list == label_answer_list
+        cnt = 0
+        for x in res:
+            if x == True:
+                cnt += 1
+        log.logger.info("the evalute acc is: %f" % (cnt / len(res)))
+
+        return total_loss / steps, total_acc / steps, cnt / len(res)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '-c', '--config_file', default='config/bert_config.json',
-        help='model config file')
+    pretrain_path = "pretrain_model/ERNIE_1.0_max-len-512-pytorch"
+    save_path = "models/best.pt"
+    batch_size = 1
+    lr = 5e-5
+    epoch = 10
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print("device: ", device)
+    if torch.cuda.device_count() > 1:
+        print('the gpu nums: ', torch.cuda.device_count())
+    model = CusArgModel(pretrain_path)
+    model.to(device)
+    # model = nn.DataParallel(model, device_ids=[0, 1, 2, 3])  # multi-GPU
+    # model.load_state_dict(torch.load(save_path))
 
-    parser.add_argument(
-        '--local_rank', default=0,
-        help='used for distributed parallel')
-    args = parser.parse_args()
-    main(args.config_file)
+    tokenizer = BertTokenizer.from_pretrained(pretrain_path)
+    opimizer = AdamW(model.parameters(), lr=lr)
+
+    # 训练数据集
+    train_dataset = MyDataSet(vocab_file=pretrain_path, text_path="data/SMP-CAIL2020-text-train.csv", 
+    file_path="data/train.csv", train_type="train")
+    
+    # 训练迭代器
+    train_iter = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    
+    # 验证数据集
+    valid_dataset = MyDataSet(vocab_file=pretrain_path, text_path="data/SMP-CAIL2020-text-train.csv", 
+    file_path="data/valid.csv", train_type="valid")
+
+    # 验证迭代器
+    valid_iter = DataLoader(valid_dataset, batch_size=1, shuffle=False)
+
+    criterion = nn.CrossEntropyLoss()
+    valid_best_loss = float("inf")
+    valid_best_acc = 0.0
+    log = Logger('trainRecord_random_seed.log', level='info')
+    for e in range(epoch):
+        print("epoch:{}".format(e + 1))
+        log.logger.info("epoch:{}".format(e + 1))
+        
+        # 验证数据
+        train_loss, train_acc = train(model, train_iter, opimizer, criterion, device)
+        print("train_acc:{} train_loss:{}".format(train_acc, train_loss))
+        
+        # 记录训练日志
+        log.logger.info("train_acc:{} train_loss:{}".format(train_acc, train_loss))
+
+        # 验证集损失函数
+        valid_loss, valid_acc, evaluate_acc = valid(model, valid_iter, criterion, device)
+        print("valid_acc:{} valid_loss:{} evaluate_acc:{}".format(valid_acc, valid_loss, evaluate_acc))
+        log.logger.info("valid_acc:{} valid_loss:{} evalute_acc:{}".format(valid_acc, valid_loss, evaluate_acc))
+        if evaluate_acc > valid_best_acc:
+            valid_best_acc = evaluate_acc
+            valid_best_loss = valid_loss
+            torch.save(model.state_dict(), save_path)
+            save_path2 = save_path + "2"
+            torch.save(model, save_path2)
+            print("save best model, evaluate_acc:{}".format(evaluate_acc))
+            log.logger.info("the best evaluate_acc model is %f " % evaluate_acc)
+
+    print("evaluate_acc:{}".format(valid_best_acc))
+    print("finished!")
