@@ -1,6 +1,5 @@
 from transformers import (BertTokenizer, BertConfig,  BertForSequenceClassification, AutoModel, BertForNextSentencePrediction,
-                          BertModel, get_linear_schedule_with_warmup,
-                          AdamW)
+                          BertModel, get_linear_schedule_with_warmup, AdamW)
                           
 import torch
 import torch.nn as nn
